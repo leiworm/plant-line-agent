@@ -1,0 +1,127 @@
+# 固定工作流定义（设计稿）
+# 原则：工具数 <= 3、顺序确定、运行中不需要判断 → 走工作流；否则交给子 Agent。
+# 工作流不经过 LLM 规划，只有最后一步可选「润色」，模型不产生任何数字。
+
+version: 0.1
+
+common:
+  context_from: context_builder          # line_id / shift_id / 班组 / 时间窗 / authorized_line_ids
+  evidence_required: true                # 输出前由证据服务校验三要素
+  on_tool_unavailable: degrade_block     # 只降级对应数据块，其余照常展示
+  audit: true                            # 每次执行写 trace_id 与工具调用日志
+  llm_role: wording_only                 # 仅组织语言，不计算、不推断、不补全
+
+workflows:
+  - id: line-snapshot
+    name: 产线现状速览
+    trigger:
+      - type: quick_button
+        button: "本线现在怎么样"
+      - type: intent
+        patterns: ["现在怎么样", "当前状态", "本班情况", "线体状态"]
+    route: sync
+    sla_ms: 2000
+    steps:
+      - id: kpi
+        tool: mcp-kpi.get_kpi_snapshot
+        args: { line_id: "${ctx.line_id}", shift_id: "${ctx.shift_id}" }
+      - id: anomalies
+        tool: mcp-events.get_active_anomalies
+        args: { line_id: "${ctx.line_id}" }
+      - id: order
+        tool: mcp-orders.get_work_order
+        args: { line_id: "${ctx.line_id}", shift_id: "${ctx.shift_id}" }
+      - id: render
+        action: template
+        template: line-snapshot-card
+        blocks: [kpi, anomalies, order]
+      - id: polish
+        action: llm_wording
+        optional: true
+        constraints: "不得增删数值、不得补充未返回的数据、不得推断原因"
+    output:
+      format: card
+      blocks:
+        - "本班 KPI（UPH / NTF / Retest + 目标 + 达成率）"
+        - "未闭环异常（红/黄/灰）"
+        - "当前工单与 SKU"
+        - "数据说明（metric_version / timestamp / 不可用数据源）"
+    fallback: "任一工具 unavailable → 该块显示「数据源不可用，最后更新 {timestamp}」"
+
+  - id: kpi-qa
+    name: KPI 问答与班次对比
+    trigger:
+      - type: quick_button
+        button: "KPI 与上一班对比"
+      - type: intent
+        patterns: ["UPH", "NTF", "Retest", "达成率", "跟上一班比", "这个指标怎么算"]
+    route: sync
+    sla_ms: 2000
+    steps:
+      - id: slots
+        action: slot_fill
+        slots: [metric, shift_a, shift_b, query]
+        glossary: skills/kpi-glossary
+        terms: skills/plant-terms
+      - id: fetch
+        action: branch
+        branches:
+          - when: "slots.shift_b 存在"
+            tool: mcp-kpi.compare_shift
+            args: { line_id: "${ctx.line_id}", shift_a: "${slots.shift_a}", shift_b: "${slots.shift_b}", metric: "${slots.metric}" }
+            note: "差值由工具返回，模型禁止自行做减法"
+          - when: "slots.metric 存在且无 shift_b"
+            tool: mcp-kpi.get_kpi_snapshot
+            args: { line_id: "${ctx.line_id}", shift_id: "${slots.shift_a}" }
+          - when: "意图为术语/口径解释"
+            tool: mcp-knowledge.search_sop
+            args: { query: "${slots.query}" }
+      - id: version_guard
+        action: validate
+        rule: "两班 metric_version 不一致 → 禁用对比并提示口径版本差异"
+      - id: render
+        action: template
+        template: kpi-answer
+      - id: polish
+        action: llm_wording
+        optional: true
+    output:
+      format: answer
+      required: ["结论", "口径与统计窗口", "证据三要素"]
+    fallback: "口径不一致 → 禁用对比；源不可用 → 降级话术"
+
+  - id: pre-shift
+    name: 班前简报
+    trigger:
+      - type: schedule
+        cron: "0 15,45 * * *"      # 占位：按实际班次时间配置，班前 15 分钟
+        tz: "Asia/Shanghai"
+    route: async
+    sla_ms: 60000
+    steps:
+      - id: last_shift_open_items
+        action: read_archived_handover
+        args: { line_id: "${ctx.line_id}", shift_id: "${ctx.prev_shift_id}" }
+      - id: plan
+        tool: mcp-orders.get_work_order
+        args: { line_id: "${ctx.line_id}", shift_id: "${ctx.shift_id}" }
+      - id: active_events
+        tool: mcp-events.get_active_anomalies
+        args: { line_id: "${ctx.line_id}" }
+      - id: render
+        action: template
+        template: pre-shift-brief
+        format_skill: skills/shift-handover-format
+    output:
+      format: draft_card
+      note: "只在 Web 内展示，不推送到任何外部渠道"
+    fallback: "生成失败 → 站内提示「班前简报生成失败，请查看总览」，不静默跳过"
+
+# 不交给工作流的场景（交给子 Agent）
+agent_routes:
+  - when: "含归因词或需 >= 4 次工具调用"
+    target: agent.anomaly-rca
+    max_tool_calls: 8
+  - when: "交接班 / 本班小结 / 遗留问题 / 班后定时"
+    target: agent.shift-review
+    requires_human_confirmation: true

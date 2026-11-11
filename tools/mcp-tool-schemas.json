@@ -1,0 +1,195 @@
+{
+  "version": "0.1",
+  "note": "只读工具白名单定义（设计稿）。所有工具由厂内 MCP Server 提供，Agent 不直连数据库或控制网。接口地址、鉴权细节待 Q-3 确认后填写。",
+  "conventions": {
+    "access": "read-only",
+    "auth": "从厂内 SSO 登录态解析 user_id / role，在 Server 内按 authorized_line_ids 过滤；越权返回空 data 并写审计",
+    "result_envelope": {
+      "data": "业务字段（对象或数组）",
+      "source": "数据来源标识 + 原始记录 URL",
+      "timestamp": "数据产生时间，ISO 8601 带时区",
+      "metric_version": "口径版本，如 kpi-2026.11",
+      "status": "ok | partial | stale | unavailable",
+      "trace_id": "串联问答与工具调用的追踪 ID"
+    },
+    "limits": {
+      "query_timeout_ms": 3000,
+      "max_window_days": 31,
+      "per_user_qps": 5,
+      "cache_ttl_seconds": 10,
+      "rule": "超时或源不可用返回 status=unavailable，不返回部分数值、不返回旧数值"
+    },
+    "forbidden": "不注册任何写工具、设备控制工具、参数下发工具、工单回写工具"
+  },
+  "servers": [
+    {
+      "name": "mcp-kpi",
+      "description": "读取既有监控系统已计算好的 KPI，禁止重算。涉及 UPH / NTF / Retest / 达成率 / 班次比较时使用。",
+      "tools": [
+        {
+          "name": "get_kpi_snapshot",
+          "description": "获取指定线体当前班次的 KPI 快照（UPH、NTF、Retest 的现值、目标值、达成率、环比）。用户问「现在怎么样」「这一班 KPI 多少」时调用。数值全部取自监控系统，不得自行计算。",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "line_id": { "type": "string", "description": "标准线体 ID，如 L03" },
+              "shift_id": { "type": "string", "description": "班次 ID；省略则取当前班次" }
+            },
+            "required": ["line_id"]
+          }
+        },
+        {
+          "name": "get_kpi_trend",
+          "description": "获取某指标在指定时间窗内的时序点列，用于归因时判断偏离起点。不做趋势外推或预测。",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "line_id": { "type": "string" },
+              "metric": { "type": "string", "enum": ["UPH", "NTF", "Retest"] },
+              "window": { "type": "string", "description": "ISO 8601 区间或枚举 current_shift / last_shift / last_24h" }
+            },
+            "required": ["line_id", "metric", "window"]
+          }
+        },
+        {
+          "name": "compare_shift",
+          "description": "确定性比较两个班次的某项 KPI，返回差值、变化率与结论标记。用户问「跟上一班比如何」时必须调用，禁止让模型自行做减法。两班 metric_version 不一致时返回 status=unavailable 并说明版本差异。",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "line_id": { "type": "string" },
+              "shift_a": { "type": "string" },
+              "shift_b": { "type": "string" },
+              "metric": { "type": "string", "enum": ["UPH", "NTF", "Retest"] }
+            },
+            "required": ["line_id", "shift_a", "shift_b", "metric"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "mcp-events",
+      "description": "读取既有监控系统已判定的异常事件。本层不重新判定是否异常、不修改事件级别。",
+      "tools": [
+        {
+          "name": "get_active_anomalies",
+          "description": "列出指定线体当前未闭环的异常事件（event_id、起止时间、事件码、设备、等级、状态）。用户问「哪台停了」「有没有没闭环的」或刷新异常卡片时调用。",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "line_id": { "type": "string" },
+              "severity": { "type": "string", "enum": ["critical", "warning", "info"], "description": "省略则返回全部级别" }
+            },
+            "required": ["line_id"]
+          }
+        },
+        {
+          "name": "get_anomaly_detail",
+          "description": "按 event_id 返回异常详情与监控系统原始记录链接，供归因 Agent 第一步调用。",
+          "inputSchema": {
+            "type": "object",
+            "properties": { "event_id": { "type": "string" } },
+            "required": ["event_id"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "mcp-orders",
+      "description": "读取工单、在制、测试明细与设备维修史等生产上下文，供归因与班次复盘关联使用。全部只读。",
+      "tools": [
+        {
+          "name": "get_work_order",
+          "description": "获取当前或指定班次的工单、SKU、计划量、报工进度、换型记录。",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "line_id": { "type": "string" },
+              "shift_id": { "type": "string" }
+            },
+            "required": ["line_id"]
+          }
+        },
+        {
+          "name": "get_wip_status",
+          "description": "获取线体或指定工位的在制状态，用于判断是否换型或堵料。",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "line_id": { "type": "string" },
+              "station_id": { "type": "string" }
+            },
+            "required": ["line_id"]
+          }
+        },
+        {
+          "name": "get_test_records",
+          "description": "按 SKU 与时间窗返回测试明细（结果、工位、治具、复测标记），用于分析 NTF / Retest 偏离。返回明细记录，不返回模型推断。",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "sku": { "type": "string" },
+              "window": { "type": "string" },
+              "result": { "type": "string", "enum": ["pass", "fail", "retest", "ntf"] }
+            },
+            "required": ["sku", "window"]
+          }
+        },
+        {
+          "name": "get_equipment_history",
+          "description": "获取设备近期事件史（启停、报警、同类事件复发次数），供归因检查清单第 5 步使用。",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "equipment_id": { "type": "string" },
+              "window": { "type": "string" }
+            },
+            "required": ["equipment_id", "window"]
+          }
+        },
+        {
+          "name": "get_maintenance_log",
+          "description": "获取设备维修与保养记录（时间、内容、更换备件），用于判断是否与异常时间相关。",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "equipment_id": { "type": "string" },
+              "window": { "type": "string" }
+            },
+            "required": ["equipment_id", "window"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "mcp-knowledge",
+      "description": "检索厂内本地向量库中的 SOP、工艺卡与历史处置案例。检索结果必须带文档出处，禁止生成无出处内容。",
+      "tools": [
+        {
+          "name": "search_sop",
+          "description": "按自然语言检索 SOP / 工艺卡片段。用户问「该找谁」「先查哪一步」「按规范怎么做」或归因 Agent 第 7 步调用。只返回文档原文片段与出处，不给操作指令。",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "query": { "type": "string" },
+              "top_k": { "type": "integer", "default": 3, "maximum": 10 }
+            },
+            "required": ["query"]
+          }
+        },
+        {
+          "name": "get_similar_cases",
+          "description": "按事件码检索历史相似案例与当时的处置记录，供归因参考。返回案例必须包含发生时间与闭环状态。",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "event_code": { "type": "string" },
+              "top_k": { "type": "integer", "default": 3, "maximum": 10 }
+            },
+            "required": ["event_code"]
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,140 @@
+# 产线班组长 Agent · 运行配置（设计稿 / 占位值）
+# 所有地址、口径、授权均为示例，投产前必须现场确认。见 docs/01 第 5 节 Q-1~Q-10。
+
+version: 0.1
+environment: on-premise
+network:
+  outbound_internet: false       # 数据不出厂，禁止任何外网调用
+  telemetry: false
+  ot_network_access: false       # Agent 不直连控制网 / PLC / 生产库
+  allowed_ingress: [web_https, sso, monitoring_readonly_api]
+
+runtime:
+  llm:
+    endpoint: "http://llm.internal:8000/v1"   # 本地模型，占位
+    model: "local-model-placeholder"
+    context_tokens: 32768
+    max_concurrency: 8
+    timeout_ms: 12000
+    temperature: 0.1
+  vector_store:
+    endpoint: "http://vector.internal:6333"   # 厂内向量库，占位
+    collections: [sop, historical_cases]
+  audit_store:
+    endpoint: "http://audit.internal:5432"    # 厂内审计库，占位
+
+# ---------------------------------------------------------------
+# 口径版本：与 skills/kpi-glossary/SKILL.md 必须保持一致
+# 变更需生产 + 设备 + IE 三方签字，变更留 diff 与审批人
+# ---------------------------------------------------------------
+metric_versions:
+  current: kpi-2026.11
+  effective_from: "2026-11-11T00:00:00+08:00"
+  approvers: [TODO_production, TODO_equipment, TODO_IE]
+  metrics:
+    UPH:
+      definition: "Units Per Hour，单位小时产出（以监控系统报表口径为准）"
+      window: "current_shift_cumulative"
+      target_source: "production_plan"
+      confirmed: false             # TODO Q-1
+    NTF:
+      definition: "No Trouble Found，送修/复测未复现占比（待确认）"
+      window: "current_shift_cumulative"
+      target_source: "TODO"
+      confirmed: false             # TODO Q-2
+    Retest:
+      definition: "复测率 / 复测台数占比（待确认分子分母）"
+      window: "current_shift_cumulative"
+      target_source: "TODO"
+      confirmed: false             # TODO Q-1
+  rules:
+    cross_version_comparison: disabled
+    on_version_change: "禁用跨版本对比 + 写口径变更审计 + 通知管理员"
+
+# ---------------------------------------------------------------
+# 权限：默认拒绝；过滤在 MCP Server 内执行，不依赖提示词
+# ---------------------------------------------------------------
+acl:
+  default: deny
+  source: sso_ldap
+  roles:
+    shift_leader:
+      scope: own_lines
+      lines: ["L03"]               # TODO 试点线体
+      can_write: false
+    equipment_engineer:
+      scope: assigned_lines
+      lines: ["L03"]
+      can_write: false
+    production_supervisor:
+      scope: workshop
+      lines: ["L01", "L02", "L03"]
+      can_write: false
+    admin:
+      scope: config_only          # 管理员不因角色获得额外产线数据
+      lines: []
+      can_write: false
+  on_unauthorized_line: "返回空 data + 写审计 + 不尝试其他 line_id"
+
+# ---------------------------------------------------------------
+# 降级：宁可不说，不可编造
+# ---------------------------------------------------------------
+degradation:
+  query_timeout_ms: 3000
+  retry: { max: 1, backoff_ms: 300 }
+  cache_ttl_seconds: 10
+  cache_rule: "缓存命中也必须带原始 timestamp，且不得冒充实时"
+  stale_after_seconds: 60
+  copy:
+    unavailable: "数据源不可用，最后更新 {timestamp}。该部分数据本次未展示。"
+    stale: "当前数据滞后（{timestamp}），以下数值仅作参考，不代表实时状态。"
+    missing_field: "缺少 {字段名}，无法判断 {问题}。需现场确认后补充。"
+  forbid:
+    - 编造数值
+    - 用历史值或上一班值冒充实时
+    - 用「大约 / 估计 / 按经验」给数字
+    - 隐藏 unavailable 状态
+
+# ---------------------------------------------------------------
+# 事件规则：站内推送，无消息旁路
+# ---------------------------------------------------------------
+event_rules:
+  source: monitoring_system_event_stream   # TODO Q-4 确认可订阅还是只能轮询
+  transport: websocket_sse
+  external_notification: false             # 需求方明确无需消息旁路
+  dedupe_window_seconds: 60
+  throttle:
+    same_line_same_code_window_seconds: 300
+    max_new_cards_per_window: 1
+    overflow: "合并计数到已有卡片"
+  severity_map:
+    source_of_truth: monitoring_system     # 级别以监控系统自带等级为准
+    unknown_code: warning
+    unknown_code_note: "等级未映射，请后台补配置"
+  card_generation: rule_engine             # 不依赖 LLM；模型故障不影响告警可见
+  llm_explanation: { optional: true, async: true, failure_policy: ignore }
+  reconnect: { replay_from: last_event_id, enabled: true }
+  storm_protection: { max_events_per_minute: 100, strategy: merge_and_count }
+
+# ---------------------------------------------------------------
+# 审计
+# ---------------------------------------------------------------
+audit:
+  log: [qa, tool_call, write_action, metric_version_change, unauthorized_attempt]
+  retention_days: TODO_according_to_plant_policy
+  fields: [trace_id, user_id, role, timestamp, tool, args_digest, status, source, metric_version, latency_ms]
+  reject_if_missing: [trace_id, user_id, timestamp]
+  pii_fields_masked: [user_name]
+
+# ---------------------------------------------------------------
+# 工具白名单（与 tools/mcp-tool-schemas.json 一致）
+# ---------------------------------------------------------------
+tool_whitelist:
+  servers: [mcp-kpi, mcp-events, mcp-orders, mcp-knowledge]
+  access: read-only
+  forbidden_tools: [write_*, control_*, parameter_download, create_work_order]
+
+# 预留扩展位（本期不实现）
+extensions:
+  notification_adapter: disabled     # 若将来允许「仅提醒、不操作」旁路
+  mcp_write: disabled                # 三期写操作，必须带人工审批
